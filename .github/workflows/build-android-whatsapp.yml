@@ -1,11 +1,10 @@
 name: Build Android Binary (with WhatsApp)
 
 on:
-  # Permite ejecutar el workflow manualmente desde la interfaz de GitHub
   workflow_dispatch:
     inputs:
       target:
-        description: 'Arquitectura de Android (aarch64-linux-android / armv7-linux-androideabi)'
+        description: 'Android architecture (aarch64-linux-android / armv7-linux-androideabi)'
         required: true
         default: 'aarch64-linux-android'
         type: choice
@@ -27,20 +26,67 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.92.0 # O la versión que uses
+          toolchain: 1.92.0
           targets: ${{ github.event.inputs.target || 'aarch64-linux-android' }}
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Install Android NDK
+      - name: Setup Android NDK
+        shell: bash
         run: |
-          # Descargar e instalar el NDK (ejemplo con la versión 26)
-          wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
-          unzip -q android-ndk-r26d-linux.zip
-          echo "ANDROID_NDK_HOME=${PWD}/android-ndk-r26d" >> $GITHUB_ENV
-          # Añadir el linker al PATH
-          echo "${PWD}/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+          set -euo pipefail
+          NDK_VERSION="r26d"
+          NDK_ZIP="android-ndk-${NDK_VERSION}-linux.zip"
+          NDK_URL="https://dl.google.com/android/repository/${NDK_ZIP}"
+          NDK_ROOT="${RUNNER_TEMP}/android-ndk"
+          NDK_HOME="${NDK_ROOT}/android-ndk-${NDK_VERSION}"
+
+          sudo apt-get update -qq
+          sudo apt-get install -y unzip
+
+          mkdir -p "${NDK_ROOT}"
+          curl -fsSL "${NDK_URL}" -o "${RUNNER_TEMP}/${NDK_ZIP}"
+          unzip -q "${RUNNER_TEMP}/${NDK_ZIP}" -d "${NDK_ROOT}"
+
+          echo "ANDROID_NDK_HOME=${NDK_HOME}" >> "$GITHUB_ENV"
+          echo "${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Configure Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ github.event.inputs.target || 'aarch64-linux-android' }}"
+          NDK_HOME="${ANDROID_NDK_HOME}"
+          TOOLCHAIN="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          ANDROID_API=21
+
+          if [[ "$TARGET" == "armv7-linux-androideabi" ]]; then
+            CC="${TOOLCHAIN}/armv7a-linux-androideabi${ANDROID_API}-clang"
+            CXX="${TOOLCHAIN}/armv7a-linux-androideabi${ANDROID_API}-clang++"
+
+            # Some crates probe legacy compiler names (arm-linux-androideabi-clang)
+            ln -sf "$CC"  "${TOOLCHAIN}/arm-linux-androideabi-clang"
+            ln -sf "$CXX" "${TOOLCHAIN}/arm-linux-androideabi-clang++"
+
+            {
+              echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=${CC}"
+              echo "CC_armv7_linux_androideabi=${CC}"
+              echo "CXX_armv7_linux_androideabi=${CXX}"
+              echo "AR_armv7_linux_androideabi=${TOOLCHAIN}/llvm-ar"
+            } >> "$GITHUB_ENV"
+
+          elif [[ "$TARGET" == "aarch64-linux-android" ]]; then
+            CC="${TOOLCHAIN}/aarch64-linux-android${ANDROID_API}-clang"
+            CXX="${TOOLCHAIN}/aarch64-linux-android${ANDROID_API}-clang++"
+
+            {
+              echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${CC}"
+              echo "CC_aarch64_linux_android=${CC}"
+              echo "CXX_aarch64_linux_android=${CXX}"
+              echo "AR_aarch64_linux_android=${TOOLCHAIN}/llvm-ar"
+            } >> "$GITHUB_ENV"
+          fi
 
       - name: Build binary (with WhatsApp feature)
         run: |
