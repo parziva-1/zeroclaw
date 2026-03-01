@@ -536,6 +536,7 @@ Notes:
 |---|---|---|
 | `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
 | `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
+| `trusted_skill_roots` | `[]` | Allowlist of directory roots for symlink targets in `workspace/skills/*` |
 | `prompt_injection_mode` | `full` | Skill prompt verbosity: `full` (inline instructions/tools) or `compact` (name/description/location only) |
 | `clawhub_token` | unset | Optional Bearer token for authenticated ClawhHub skill downloads |
 
@@ -548,7 +549,8 @@ Notes:
   - `ZEROCLAW_SKILLS_PROMPT_MODE` accepts `full` or `compact`.
 - Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
 - `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
-- Skill loading and `zeroclaw skills install` both apply a static security audit. Skills that contain symlinks, script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
+- Symlinked workspace skills are blocked by default. Set `trusted_skill_roots` to allow local shared-skill directories after explicit trust review.
+- `zeroclaw skills install` and `zeroclaw skills audit` apply a static security audit. Skills that contain script-like files, high-risk shell payload snippets, or unsafe markdown link traversal are rejected.
 - `clawhub_token` is sent as `Authorization: Bearer <token>` when downloading from ClawhHub. Obtain a token from [https://clawhub.ai](https://clawhub.ai) after signing in. Required if the API returns 429 (rate-limited) or 401 (unauthorized) for anonymous requests.
 
 **ClawhHub token example:**
@@ -710,8 +712,8 @@ When using `credential_profile`, do not also set the same header key in `args.he
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `web_fetch` for page-to-text extraction |
-| `provider` | `fast_html2md` | Fetch/render backend: `fast_html2md`, `nanohtml2text`, `firecrawl` |
-| `api_key` | unset | API key for provider backends that require it (e.g. `firecrawl`) |
+| `provider` | `fast_html2md` | Fetch/render backend: `fast_html2md`, `nanohtml2text`, `firecrawl`, `tavily` |
+| `api_key` | unset | API key for provider backends that require it (e.g. `firecrawl`, `tavily`) |
 | `api_url` | unset | Optional API URL override (self-hosted/alternate endpoint) |
 | `allowed_domains` | `["*"]` | Domain allowlist (`"*"` allows all public domains) |
 | `blocked_domains` | `[]` | Denylist applied before allowlist |
@@ -885,6 +887,10 @@ Notes:
   - One-step flow: `/approve <tool>`.
   - Two-step flow: `/approve-request <tool>` then `/approve-confirm <request-id>` (same sender + same chat/channel).
   Both paths write to `autonomy.auto_approve` and remove the tool from `autonomy.always_ask`.
+- For pending runtime execution prompts (including Telegram inline approval buttons), use:
+  - `/approve-allow <request-id>` to approve only the current pending request.
+  - `/approve-deny <request-id>` to reject the current pending request.
+  This path does not modify `autonomy.auto_approve` or `autonomy.always_ask`.
 - `non_cli_natural_language_approval_mode` controls how strict natural-language approval intents are:
   - `direct` (default): natural-language approval grants immediately (private-chat friendly).
   - `request_confirm`: natural-language approval creates a pending request that needs explicit confirm.

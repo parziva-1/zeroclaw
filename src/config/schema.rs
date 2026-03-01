@@ -77,6 +77,7 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         "cohere" => "command-a-03-2025",
         "moonshot" => "kimi-k2.5",
+        "stepfun" => "step-3.5-flash",
         "hunyuan" => "hunyuan-t1-latest",
         "glm" | "zai" => "glm-5",
         "minimax" => "MiniMax-M2.5",
@@ -1026,6 +1027,11 @@ pub struct SkillsConfig {
     /// If unset, defaults to `$HOME/open-skills` when enabled.
     #[serde(default)]
     pub open_skills_dir: Option<String>,
+    /// Optional allowlist of canonical directory roots for workspace skill symlink targets.
+    /// Symlinked workspace skills are rejected unless their resolved targets are under one
+    /// of these roots. Accepts absolute paths and `~/` home-relative paths.
+    #[serde(default)]
+    pub trusted_skill_roots: Vec<String>,
     /// Allow script-like files in skills (`.sh`, `.bash`, `.ps1`, shebang shell files).
     /// Default: `false` (secure by default).
     #[serde(default)]
@@ -1195,6 +1201,58 @@ pub struct CostConfig {
     /// Per-model pricing (USD per 1M tokens)
     #[serde(default)]
     pub prices: std::collections::HashMap<String, ModelPricing>,
+
+    /// Runtime budget enforcement policy (`[cost.enforcement]`).
+    #[serde(default)]
+    pub enforcement: CostEnforcementConfig,
+}
+
+/// Budget enforcement behavior when projected spend approaches/exceeds limits.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CostEnforcementMode {
+    /// Log warnings only; never block the request.
+    Warn,
+    /// Attempt one downgrade to a cheaper route/model, then block if still over budget.
+    RouteDown,
+    /// Block immediately when projected spend exceeds configured limits.
+    Block,
+}
+
+fn default_cost_enforcement_mode() -> CostEnforcementMode {
+    CostEnforcementMode::Warn
+}
+
+/// Runtime budget enforcement controls (`[cost.enforcement]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CostEnforcementConfig {
+    /// Enforcement behavior. Default: `warn`.
+    #[serde(default = "default_cost_enforcement_mode")]
+    pub mode: CostEnforcementMode,
+    /// Optional fallback model (or `hint:*`) when `mode = "route_down"`.
+    #[serde(default = "default_route_down_model")]
+    pub route_down_model: Option<String>,
+    /// Extra reserve added to token/cost estimates (percentage, 0-100). Default: `10`.
+    #[serde(default = "default_cost_reserve_percent")]
+    pub reserve_percent: u8,
+}
+
+fn default_route_down_model() -> Option<String> {
+    Some("hint:fast".to_string())
+}
+
+fn default_cost_reserve_percent() -> u8 {
+    10
+}
+
+impl Default for CostEnforcementConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_cost_enforcement_mode(),
+            route_down_model: default_route_down_model(),
+            reserve_percent: default_cost_reserve_percent(),
+        }
+    }
 }
 
 /// Per-model pricing entry (USD per 1M tokens).
@@ -1230,6 +1288,7 @@ impl Default for CostConfig {
             warn_at_percent: default_warn_percent(),
             allow_override: false,
             prices: get_default_pricing(),
+            enforcement: CostEnforcementConfig::default(),
         }
     }
 }
@@ -4285,6 +4344,19 @@ pub enum StreamMode {
     Partial,
 }
 
+/// Progress verbosity for channels that support draft streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ProgressMode {
+    /// Show all progress lines (thinking rounds, tool-count lines, tool lifecycle).
+    Verbose,
+    /// Show only tool lifecycle lines (start + completion).
+    #[default]
+    Compact,
+    /// Suppress progress lines and stream only final answer text.
+    Off,
+}
+
 fn default_draft_update_interval_ms() -> u64 {
     1000
 }
@@ -4530,6 +4602,9 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Draft progress verbosity for streaming updates.
+    #[serde(default)]
+    pub progress_mode: ProgressMode,
     /// Group-chat trigger controls.
     #[serde(default)]
     pub group_reply: Option<GroupReplyConfig>,
@@ -6957,6 +7032,75 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
     Ok(())
 }
 
+fn legacy_feishu_table(raw_toml: &toml::Value) -> Option<&toml::map::Map<String, toml::Value>> {
+    raw_toml
+        .get("channels_config")?
+        .as_table()?
+        .get("feishu")?
+        .as_table()
+}
+
+fn extract_legacy_feishu_mention_only(raw_toml: &toml::Value) -> Option<bool> {
+    legacy_feishu_table(raw_toml)?
+        .get("mention_only")
+        .and_then(toml::Value::as_bool)
+}
+
+fn has_legacy_feishu_mention_only(raw_toml: &toml::Value) -> bool {
+    legacy_feishu_table(raw_toml)
+        .and_then(|table| table.get("mention_only"))
+        .is_some()
+}
+
+fn has_legacy_feishu_use_feishu(raw_toml: &toml::Value) -> bool {
+    legacy_feishu_table(raw_toml)
+        .and_then(|table| table.get("use_feishu"))
+        .is_some()
+}
+
+fn apply_feishu_legacy_compat(
+    config: &mut Config,
+    legacy_feishu_mention_only: Option<bool>,
+    legacy_feishu_use_feishu_present: bool,
+    saw_legacy_feishu_mention_only_path: bool,
+    saw_legacy_feishu_use_feishu_path: bool,
+) {
+    // Backward compatibility: users sometimes migrate config snippets from
+    // [channels_config.lark] to [channels_config.feishu] and keep old keys.
+    if let Some(feishu_cfg) = config.channels_config.feishu.as_mut() {
+        if let Some(legacy_mention_only) = legacy_feishu_mention_only {
+            if feishu_cfg.group_reply.is_none() {
+                let mapped_mode = if legacy_mention_only {
+                    GroupReplyMode::MentionOnly
+                } else {
+                    GroupReplyMode::AllMessages
+                };
+                feishu_cfg.group_reply = Some(GroupReplyConfig {
+                    mode: Some(mapped_mode),
+                    allowed_sender_ids: Vec::new(),
+                });
+                tracing::warn!(
+                    "Legacy key [channels_config.feishu].mention_only is deprecated; mapped to [channels_config.feishu.group_reply].mode."
+                );
+            } else if saw_legacy_feishu_mention_only_path {
+                tracing::warn!(
+                    "Legacy key [channels_config.feishu].mention_only is ignored because [channels_config.feishu.group_reply] is already set."
+                );
+            }
+        } else if saw_legacy_feishu_mention_only_path {
+            tracing::warn!(
+                "Legacy key [channels_config.feishu].mention_only is invalid; expected boolean."
+            );
+        }
+
+        if legacy_feishu_use_feishu_present || saw_legacy_feishu_use_feishu_path {
+            tracing::warn!(
+                "Legacy key [channels_config.feishu].use_feishu is redundant and ignored; [channels_config.feishu] always uses Feishu endpoints."
+            );
+        }
+    }
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -6995,24 +7139,23 @@ impl Config {
                 .await
                 .context("Failed to read config file")?;
 
-            // Track ignored/unknown config keys to warn users about silent misconfigurations
-            // (e.g., using [providers.ollama] which doesn't exist instead of top-level api_url)
-            let mut ignored_paths: Vec<String> = Vec::new();
-            let mut config: Config = serde_ignored::deserialize(
-                toml::de::Deserializer::parse(&contents).context("Failed to parse config file")?,
-                |path| {
-                    ignored_paths.push(path.to_string());
-                },
-            )
-            .context("Failed to deserialize config file")?;
+            // Parse raw TOML first so legacy compatibility rewrites can be applied after
+            // deserialization.
+            let raw_toml: toml::Value =
+                toml::from_str(&contents).context("Failed to parse config file")?;
+            let legacy_feishu_mention_only = extract_legacy_feishu_mention_only(&raw_toml);
+            let legacy_feishu_mention_only_present = has_legacy_feishu_mention_only(&raw_toml);
+            let legacy_feishu_use_feishu_present = has_legacy_feishu_use_feishu(&raw_toml);
+            let mut config: Config =
+                toml::from_str(&contents).context("Failed to deserialize config file")?;
 
-            // Warn about each unknown config key
-            for path in ignored_paths {
-                tracing::warn!(
-                    "Unknown config key ignored: \"{}\". Check config.toml for typos or deprecated options.",
-                    path
-                );
-            }
+            apply_feishu_legacy_compat(
+                &mut config,
+                legacy_feishu_mention_only,
+                legacy_feishu_use_feishu_present,
+                legacy_feishu_mention_only_present,
+                legacy_feishu_use_feishu_present,
+            );
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
@@ -7746,6 +7889,44 @@ impl Config {
         }
         if self.web_search.timeout_secs == 0 {
             anyhow::bail!("web_search.timeout_secs must be greater than 0");
+        }
+
+        // Cost
+        if self.cost.warn_at_percent > 100 {
+            anyhow::bail!("cost.warn_at_percent must be between 0 and 100");
+        }
+        if self.cost.enforcement.reserve_percent > 100 {
+            anyhow::bail!("cost.enforcement.reserve_percent must be between 0 and 100");
+        }
+        if matches!(self.cost.enforcement.mode, CostEnforcementMode::RouteDown) {
+            let route_down_model = self
+                .cost
+                .enforcement
+                .route_down_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cost.enforcement.route_down_model must be set when mode is route_down"
+                    )
+                })?;
+
+            if let Some(route_hint) = route_down_model
+                .strip_prefix("hint:")
+                .map(str::trim)
+                .filter(|hint| !hint.is_empty())
+            {
+                if !self
+                    .model_routes
+                    .iter()
+                    .any(|route| route.hint.trim() == route_hint)
+                {
+                    anyhow::bail!(
+                        "cost.enforcement.route_down_model uses hint '{route_hint}', but no matching [[model_routes]] entry exists"
+                    );
+                }
+            }
         }
 
         // Scheduler
@@ -8972,6 +9153,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: ProgressMode::default(),
             ack_enabled: true,
             group_reply: None,
             base_url: None,
@@ -9399,6 +9581,7 @@ ws_url = "ws://127.0.0.1:3002"
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    progress_mode: ProgressMode::default(),
                     ack_enabled: true,
                     group_reply: None,
                     base_url: None,
@@ -9880,6 +10063,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            progress_mode: ProgressMode::default(),
             ack_enabled: true,
             group_reply: None,
             base_url: None,
@@ -10064,6 +10248,7 @@ tool_dispatcher = "xml"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            progress_mode: ProgressMode::default(),
             ack_enabled: true,
             group_reply: None,
             base_url: None,
@@ -10082,6 +10267,7 @@ tool_dispatcher = "xml"
         let json = r#"{"bot_token":"tok","allowed_users":[]}"#;
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.stream_mode, StreamMode::Off);
+        assert_eq!(parsed.progress_mode, ProgressMode::Compact);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
         assert!(parsed.base_url.is_none());
@@ -10097,6 +10283,31 @@ tool_dispatcher = "xml"
         let json = r#"{"bot_token":"tok","allowed_users":[],"base_url":"https://tapi.bale.ai"}"#;
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.base_url, Some("https://tapi.bale.ai".to_string()));
+    }
+
+    #[test]
+    async fn progress_mode_deserializes_variants() {
+        let verbose: ProgressMode = serde_json::from_str(r#""verbose""#).unwrap();
+        let compact: ProgressMode = serde_json::from_str(r#""compact""#).unwrap();
+        let off: ProgressMode = serde_json::from_str(r#""off""#).unwrap();
+
+        assert_eq!(verbose, ProgressMode::Verbose);
+        assert_eq!(compact, ProgressMode::Compact);
+        assert_eq!(off, ProgressMode::Off);
+    }
+
+    #[test]
+    async fn telegram_config_deserializes_progress_mode_verbose() {
+        let json = r#"{"bot_token":"tok","allowed_users":[],"progress_mode":"verbose"}"#;
+        let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.progress_mode, ProgressMode::Verbose);
+    }
+
+    #[test]
+    async fn telegram_config_deserializes_progress_mode_off() {
+        let json = r#"{"bot_token":"tok","allowed_users":[],"progress_mode":"off"}"#;
+        let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.progress_mode, ProgressMode::Off);
     }
 
     #[test]
@@ -11675,6 +11886,9 @@ provider_api = "not-a-real-mode"
         let openai = resolve_default_model_id(None, Some("openai"));
         assert_eq!(openai, "gpt-5.2");
 
+        let stepfun = resolve_default_model_id(None, Some("stepfun"));
+        assert_eq!(stepfun, "step-3.5-flash");
+
         let bedrock = resolve_default_model_id(None, Some("aws-bedrock"));
         assert_eq!(bedrock, "anthropic.claude-sonnet-4-5-20250929-v1:0");
     }
@@ -11686,6 +11900,12 @@ provider_api = "not-a-real-mode"
 
         let google_alias = resolve_default_model_id(None, Some("google-gemini"));
         assert_eq!(google_alias, "gemini-2.5-pro");
+
+        let step_alias = resolve_default_model_id(None, Some("step"));
+        assert_eq!(step_alias, "step-3.5-flash");
+
+        let step_ai_alias = resolve_default_model_id(None, Some("step-ai"));
+        assert_eq!(step_ai_alias, "step-3.5-flash");
     }
 
     #[test]
@@ -12968,6 +13188,83 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn feishu_legacy_key_extractors_detect_compat_fields() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+[channels_config.feishu]
+app_id = "cli_123"
+app_secret = "secret"
+mention_only = true
+use_feishu = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(extract_legacy_feishu_mention_only(&raw), Some(true));
+        assert!(has_legacy_feishu_mention_only(&raw));
+        assert!(has_legacy_feishu_use_feishu(&raw));
+    }
+
+    #[test]
+    async fn feishu_legacy_mention_only_maps_to_group_reply_mode() {
+        let mut parsed = Config::default();
+        parsed.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_123".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: None,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
+        });
+
+        apply_feishu_legacy_compat(&mut parsed, Some(true), true, true, true);
+
+        let feishu = parsed
+            .channels_config
+            .feishu
+            .expect("feishu config should exist");
+        assert_eq!(
+            feishu.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+    }
+
+    #[test]
+    async fn feishu_legacy_mention_only_does_not_override_group_reply() {
+        let mut parsed = Config::default();
+        parsed.channels_config.feishu = Some(FeishuConfig {
+            app_id: "cli_123".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: Some(GroupReplyConfig {
+                mode: Some(GroupReplyMode::AllMessages),
+                allowed_sender_ids: vec![],
+            }),
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
+        });
+
+        apply_feishu_legacy_compat(&mut parsed, Some(true), false, true, false);
+
+        let feishu = parsed
+            .channels_config
+            .feishu
+            .expect("feishu config should exist");
+        assert_eq!(
+            feishu.effective_group_reply_mode(),
+            GroupReplyMode::AllMessages
+        );
+    }
+
+    #[test]
     async fn qq_config_defaults_to_webhook_receive_mode() {
         let json = r#"{"app_id":"123","app_secret":"secret"}"#;
         let parsed: QQConfig = serde_json::from_str(json).unwrap();
@@ -13691,5 +13988,81 @@ sensitivity = 0.9
         config
             .validate()
             .expect("disabled coordination should allow empty lead agent");
+    }
+
+    #[test]
+    async fn cost_enforcement_defaults_are_stable() {
+        let cost = CostConfig::default();
+        assert_eq!(cost.enforcement.mode, CostEnforcementMode::Warn);
+        assert_eq!(
+            cost.enforcement.route_down_model.as_deref(),
+            Some("hint:fast")
+        );
+        assert_eq!(cost.enforcement.reserve_percent, 10);
+    }
+
+    #[test]
+    async fn cost_enforcement_config_parses_route_down_mode() {
+        let parsed: CostConfig = toml::from_str(
+            r#"
+enabled = true
+
+[enforcement]
+mode = "route_down"
+route_down_model = "hint:fast"
+reserve_percent = 15
+"#,
+        )
+        .expect("cost enforcement should parse");
+
+        assert!(parsed.enabled);
+        assert_eq!(parsed.enforcement.mode, CostEnforcementMode::RouteDown);
+        assert_eq!(
+            parsed.enforcement.route_down_model.as_deref(),
+            Some("hint:fast")
+        );
+        assert_eq!(parsed.enforcement.reserve_percent, 15);
+    }
+
+    #[test]
+    async fn validation_rejects_cost_enforcement_reserve_over_100() {
+        let mut config = Config::default();
+        config.cost.enforcement.reserve_percent = 150;
+        let err = config
+            .validate()
+            .expect_err("expected cost.enforcement.reserve_percent validation failure");
+        assert!(err.to_string().contains("cost.enforcement.reserve_percent"));
+    }
+
+    #[test]
+    async fn validation_rejects_route_down_hint_without_matching_route() {
+        let mut config = Config::default();
+        config.cost.enforcement.mode = CostEnforcementMode::RouteDown;
+        config.cost.enforcement.route_down_model = Some("hint:fast".to_string());
+        let err = config
+            .validate()
+            .expect_err("route_down hint should require a matching model route");
+        assert!(err
+            .to_string()
+            .contains("cost.enforcement.route_down_model uses hint 'fast'"));
+    }
+
+    #[test]
+    async fn validation_accepts_route_down_hint_with_matching_route() {
+        let mut config = Config::default();
+        config.cost.enforcement.mode = CostEnforcementMode::RouteDown;
+        config.cost.enforcement.route_down_model = Some("hint:fast".to_string());
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "fast".to_string(),
+            provider: "openrouter".to_string(),
+            model: "openai/gpt-4.1-mini".to_string(),
+            api_key: None,
+            max_tokens: None,
+            transport: None,
+        }];
+
+        config
+            .validate()
+            .expect("matching route_down hint route should validate");
     }
 }

@@ -15,9 +15,9 @@
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
 pub(crate) mod ack_reaction;
+pub mod acp;
 pub mod bluebubbles;
 pub mod clawdtalk;
-pub mod acp;
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
@@ -78,11 +78,12 @@ pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
     build_shell_policy_instructions, build_tool_instructions_from_specs,
-    run_tool_call_loop_with_reply_target, scrub_credentials, SafetyHeartbeatConfig,
+    run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
+    NonCliApprovalPrompt, SafetyHeartbeatConfig,
 };
 use crate::agent::session::{resolve_session_id, shared_session_manager, Session, SessionManager};
 use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
-use crate::config::{Config, NonCliNaturalLanguageApprovalMode};
+use crate::config::{Config, NonCliNaturalLanguageApprovalMode, ProgressMode};
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
@@ -104,8 +105,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Per-sender conversation history for channel messages.
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
-type ConversationLockMap =
-    Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+type ConversationLockMap = Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -165,6 +165,23 @@ fn clear_live_channels() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+}
+
+fn runtime_telegram_progress_mode_store() -> &'static Mutex<ProgressMode> {
+    static STORE: OnceLock<Mutex<ProgressMode>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(ProgressMode::default()))
+}
+
+fn set_runtime_telegram_progress_mode(mode: ProgressMode) {
+    *runtime_telegram_progress_mode_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = mode;
+}
+
+fn runtime_telegram_progress_mode() -> ProgressMode {
+    *runtime_telegram_progress_mode_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 pub(crate) fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
@@ -233,6 +250,7 @@ struct ChannelRuntimeDefaults {
     api_key: Option<String>,
     api_url: Option<String>,
     reliability: crate::config::ReliabilityConfig,
+    cost: crate::config::CostConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -684,6 +702,50 @@ fn split_internal_progress_delta(delta: &str) -> (bool, &str) {
     }
 }
 
+fn effective_progress_mode_for_message(
+    channel_name: &str,
+    expose_internal_tool_details: bool,
+) -> ProgressMode {
+    if channel_name.eq_ignore_ascii_case("cli") || expose_internal_tool_details {
+        ProgressMode::Verbose
+    } else if channel_name.eq_ignore_ascii_case("telegram") {
+        runtime_telegram_progress_mode()
+    } else {
+        ProgressMode::Off
+    }
+}
+
+fn is_verbose_only_progress_line(delta: &str) -> bool {
+    let trimmed = delta.trim_start();
+    trimmed.starts_with("\u{1f914} Thinking")
+        || trimmed.starts_with("\u{1f4ac} Got ")
+        || trimmed.starts_with("\u{21bb} Retrying")
+        || trimmed.starts_with("\u{26a0}\u{fe0f} Loop detected")
+}
+
+fn upsert_progress_section(accumulated: &mut String, block: &str) {
+    let section = format!(
+        "{}{}{}",
+        crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
+        block,
+        crate::agent::loop_::DRAFT_PROGRESS_SECTION_END
+    );
+    if let Some(start) = accumulated.find(crate::agent::loop_::DRAFT_PROGRESS_SECTION_START) {
+        if let Some(end_offset) =
+            accumulated[start..].find(crate::agent::loop_::DRAFT_PROGRESS_SECTION_END)
+        {
+            let end = start + end_offset + crate::agent::loop_::DRAFT_PROGRESS_SECTION_END.len();
+            accumulated.replace_range(start..end, &section);
+            return;
+        }
+    }
+    accumulated.push_str(&section);
+}
+
+fn strip_progress_section_markers(text: &str) -> String {
+    text.replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_START, "")
+        .replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_END, "")
+}
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
@@ -993,6 +1055,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
+        cost: config.cost.clone(),
     }
 }
 
@@ -1038,6 +1101,7 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
+        cost: crate::config::CostConfig::default(),
     }
 }
 
@@ -2181,6 +2245,27 @@ async fn handle_runtime_command_if_needed(
         }
     }
 
+    /// Handle `/approve-allow <request-id>` for pending runtime execution prompts.
+    ///
+    /// This path confirms only the current pending request and intentionally does
+    /// not persist approval policy changes for normal tools.
+    async fn handle_pending_runtime_approval_side_effects(
+        ctx: &ChannelRuntimeContext,
+        request_id: &str,
+        tool_name: &str,
+    ) -> String {
+        if tool_name == APPROVAL_ALL_TOOLS_ONCE_TOKEN {
+            let remaining = ctx.approval_manager.grant_non_cli_allow_all_once();
+            format!(
+                "Approved one-time all-tools bypass from request `{request_id}`.\nApplies to the next non-CLI agent tool-execution turn only.\nThis bypass is runtime-only and does not persist to config.\nChannel exclusions from `autonomy.non_cli_excluded_tools` still apply.\nQueued one-time all-tools bypass tokens: `{remaining}`."
+            )
+        } else {
+            format!(
+                "Approved pending execution request `{request_id}` for `{tool_name}`.\nThis approval applies only to the current pending request and does not change persisted approval policy.\nTo persist approval for future requests, use `/approve {tool_name}` or the `/approve-request` + `/approve-confirm` flow."
+            )
+        }
+    }
+
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
@@ -2644,11 +2729,10 @@ async fn handle_runtime_command_if_needed(
                     Ok(req) => {
                         ctx.approval_manager
                             .record_non_cli_pending_resolution(&request_id, ApprovalResponse::Yes);
-                        let approval_message = handle_confirm_tool_approval_side_effects(
+                        let approval_message = handle_pending_runtime_approval_side_effects(
                             ctx,
                             &request_id,
                             &req.tool_name,
-                            source_channel,
                         )
                         .await;
                         runtime_trace::record_event(
@@ -3346,11 +3430,10 @@ or tune thresholds in config.",
             match session.get_history().await {
                 Ok(history) => {
                     tracing::debug!(history_len = history.len(), "session history loaded");
-                    let filtered: Vec<ChatMessage> =
-                        history
-                            .into_iter()
-                            .filter(|m| crate::providers::is_user_or_assistant_role(m.role.as_str()))
-                            .collect();
+                    let filtered: Vec<ChatMessage> = history
+                        .into_iter()
+                        .filter(|m| crate::providers::is_user_or_assistant_role(m.role.as_str()))
+                        .collect();
                     let mut histories = ctx
                         .conversation_histories
                         .lock()
@@ -3462,6 +3545,8 @@ or tune thresholds in config.",
 
     let expose_internal_tool_details =
         msg.channel == "cli" || should_expose_internal_tool_details(&msg.content);
+    let progress_mode =
+        effective_progress_mode_for_message(msg.channel.as_str(), expose_internal_tool_details);
     let excluded_tools_snapshot = if msg.channel == "cli" {
         Vec::new()
     } else {
@@ -3529,7 +3614,7 @@ or tune thresholds in config.",
         let channel = Arc::clone(channel_ref);
         let reply_target = msg.reply_target.clone();
         let draft_id = draft_id_ref.to_string();
-        let suppress_internal_progress = !expose_internal_tool_details;
+        let mode = progress_mode;
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
             while let Some(delta) = rx.recv().await {
@@ -3537,14 +3622,32 @@ or tune thresholds in config.",
                     accumulated.clear();
                     continue;
                 }
-                let (is_internal_progress, visible_delta) = split_internal_progress_delta(&delta);
-                if suppress_internal_progress && is_internal_progress {
-                    continue;
-                }
+                if let Some(block) =
+                    delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL)
+                {
+                    if mode == ProgressMode::Off {
+                        continue;
+                    }
+                    upsert_progress_section(&mut accumulated, block);
+                } else {
+                    let (is_internal_progress, visible_delta) =
+                        split_internal_progress_delta(&delta);
+                    if is_internal_progress {
+                        if mode == ProgressMode::Off {
+                            continue;
+                        }
+                        if mode == ProgressMode::Compact
+                            && is_verbose_only_progress_line(visible_delta)
+                        {
+                            continue;
+                        }
+                    }
 
-                accumulated.push_str(visible_delta);
+                    accumulated.push_str(visible_delta);
+                }
+                let display_text = strip_progress_section_markers(&accumulated);
                 if let Err(e) = channel
-                    .update_draft(&reply_target, &draft_id, &accumulated)
+                    .update_draft(&reply_target, &draft_id, &display_text)
                     .await
                 {
                     tracing::debug!("Draft update failed: {e}");
@@ -3585,33 +3688,86 @@ or tune thresholds in config.",
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let cost_enforcement_context = crate::agent::loop_::create_cost_enforcement_context(
+        &runtime_defaults.cost,
+        ctx.workspace_dir.as_path(),
+    );
+
+    let (approval_prompt_tx, mut approval_prompt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<NonCliApprovalPrompt>();
+    let non_cli_approval_context = if msg.channel != "cli" && target_channel.is_some() {
+        Some(NonCliApprovalContext {
+            sender: msg.sender.clone(),
+            reply_target: msg.reply_target.clone(),
+            prompt_tx: approval_prompt_tx,
+        })
+    } else {
+        drop(approval_prompt_tx);
+        None
+    };
+    let approval_prompt_dispatcher = if let (Some(channel_ref), true) =
+        (target_channel.as_ref(), non_cli_approval_context.is_some())
+    {
+        let channel = Arc::clone(channel_ref);
+        let reply_target = msg.reply_target.clone();
+        let thread_ts = msg.thread_ts.clone();
+        Some(tokio::spawn(async move {
+            while let Some(prompt) = approval_prompt_rx.recv().await {
+                if let Err(err) = channel
+                    .send_approval_prompt(
+                        &reply_target,
+                        &prompt.request_id,
+                        &prompt.tool_name,
+                        &prompt.arguments,
+                        thread_ts.clone(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to send non-CLI approval prompt for request {}: {err}",
+                        prompt.request_id
+                    );
+                }
+            }
+        }))
+    } else {
+        None
+    };
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop_with_reply_target(
-                active_provider.as_ref(),
-                &mut history,
-                ctx.tools_registry.as_ref(),
-                ctx.observer.as_ref(),
-                route.provider.as_str(),
-                route.model.as_str(),
-                runtime_defaults.temperature,
-                true,
-                Some(ctx.approval_manager.as_ref()),
-                msg.channel.as_str(),
-                Some(msg.reply_target.as_str()),
-                &ctx.multimodal,
-                ctx.max_tool_iterations,
-                Some(cancellation_token.clone()),
-                delta_tx,
-                ctx.hooks.as_deref(),
-                &excluded_tools_snapshot,
+            crate::agent::loop_::scope_cost_enforcement_context(
+                cost_enforcement_context,
+                run_tool_call_loop_with_non_cli_approval_context(
+                    active_provider.as_ref(),
+                    &mut history,
+                    ctx.tools_registry.as_ref(),
+                    ctx.observer.as_ref(),
+                    route.provider.as_str(),
+                    route.model.as_str(),
+                    runtime_defaults.temperature,
+                    true,
+                    Some(ctx.approval_manager.as_ref()),
+                    msg.channel.as_str(),
+                    non_cli_approval_context,
+                    &ctx.multimodal,
+                    ctx.max_tool_iterations,
+                    Some(cancellation_token.clone()),
+                    delta_tx,
+                    ctx.hooks.as_deref(),
+                    &excluded_tools_snapshot,
+                    progress_mode,
+                    ctx.safety_heartbeat.clone(),
+                ),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
 
     if let Some(handle) = draft_updater {
+        let _ = handle.await;
+    }
+    if let Some(handle) = approval_prompt_dispatcher {
         let _ = handle.await;
     }
 
@@ -4981,8 +5137,14 @@ fn collect_configured_channels(
 
     #[cfg(not(feature = "channel-lark"))]
     if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
+        let executable = std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
         tracing::warn!(
-            "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
+            "Lark/Feishu channel is configured but this binary was compiled without `channel-lark`; skipping Lark/Feishu startup. \
+             binary={executable}. \
+             If you built from source, run the built artifact directly (for example `./target/release/zeroclaw daemon`) \
+             or run `cargo run --features channel-lark -- daemon`."
         );
     }
 
@@ -5484,6 +5646,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
+    let telegram_progress_mode = config
+        .channels_config
+        .telegram
+        .as_ref()
+        .map(|tg| tg.progress_mode)
+        .unwrap_or_default();
+    set_runtime_telegram_progress_mode(telegram_progress_mode);
 
     let session_manager = shared_session_manager(&config.agent.session, &config.workspace_dir)?
         .map(|mgr| mgr as Arc<dyn SessionManager + Send + Sync>);
@@ -7465,7 +7634,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Approved supervised execution for `mock_price`"));
+        assert!(sent[0].contains("Approved pending execution request"));
         assert!(sent[0].contains("mock_price"));
         drop(sent);
 
@@ -7564,6 +7733,142 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         assert!(!approval_manager.has_non_cli_pending_request(&pending.request_id));
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_prompts_and_waits_for_non_cli_always_ask_approval() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            always_ask: vec!["mock_price".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        let runtime_ctx_for_first_turn = runtime_ctx.clone();
+        let first_turn = tokio::spawn(async move {
+            process_channel_message(
+                runtime_ctx_for_first_turn,
+                traits::ChannelMessage {
+                    id: "msg-non-cli-approval-1".to_string(),
+                    sender: "alice".to_string(),
+                    reply_target: "chat-1".to_string(),
+                    content: "What is the BTC price now?".to_string(),
+                    channel: "telegram".to_string(),
+                    timestamp: 1,
+                    thread_ts: None,
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        });
+
+        let request_id = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let pending = runtime_ctx.approval_manager.list_non_cli_pending_requests(
+                    Some("alice"),
+                    Some("telegram"),
+                    Some("chat-1"),
+                );
+                if let Some(req) = pending.first() {
+                    break req.request_id.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("pending approval request should be created for always_ask tool");
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-non-cli-approval-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: format!("/approve-allow {request_id}"),
+                channel: "telegram".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), first_turn)
+            .await
+            .expect("first channel turn should finish after approval")
+            .expect("first channel turn task should not panic");
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter()
+                .any(|entry| entry.contains("Approval required for tool `mock_price`")),
+            "channel should emit non-cli approval prompt"
+        );
+        assert!(
+            sent.iter()
+                .any(|entry| entry.contains("Approved pending execution request")),
+            "channel should acknowledge explicit approval command"
+        );
+        assert!(
+            sent.iter()
+                .any(|entry| entry.contains("BTC is currently around")),
+            "tool call should execute after approval and produce final response"
+        );
+        assert!(
+            sent.iter().all(|entry| !entry.contains("Denied by user.")),
+            "always_ask tool should not be silently denied once non-cli approval prompt path is wired"
+        );
+        assert!(
+            runtime_ctx.approval_manager.needs_approval("mock_price"),
+            "/approve-allow should not downgrade always_ask policy for future requests"
+        );
+        assert!(
+            runtime_ctx
+                .approval_manager
+                .always_ask_tools()
+                .contains("mock_price"),
+            "always_ask runtime policy should remain intact after one-shot approval"
+        );
     }
 
     #[tokio::test]
@@ -7977,7 +8282,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Approved supervised execution for `mock_price`"));
+        assert!(sent[0].contains("Approved pending execution request"));
         assert!(sent[0].contains("mock_price"));
         drop(sent);
 
@@ -7987,6 +8292,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             approval_manager.take_non_cli_pending_resolution(&request_id),
             Some(ApprovalResponse::Yes)
+        );
+        assert!(
+            approval_manager.needs_approval("mock_price"),
+            "/approve-allow should not persistently auto-approve tools"
+        );
+        assert!(
+            approval_manager.always_ask_tools().contains("mock_price"),
+            "always_ask tool should remain in always_ask after one-shot approval"
         );
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
@@ -9142,6 +9455,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_key: None,
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
+                        cost: crate::config::CostConfig::default(),
                     },
                     perplexity_filter: crate::config::PerplexityFilterConfig::default(),
                     outbound_leak_guard: crate::config::OutboundLeakGuardConfig::default(),
@@ -11160,6 +11474,42 @@ Done reminder set for 1:38 AM."#;
         let (is_internal_plain, plain) = split_internal_progress_delta("final answer");
         assert!(!is_internal_plain);
         assert_eq!(plain, "final answer");
+    }
+
+    #[test]
+    fn effective_progress_mode_defaults_non_telegram_to_off() {
+        assert_eq!(
+            effective_progress_mode_for_message("draft-streaming-channel", false),
+            ProgressMode::Off
+        );
+        assert_eq!(
+            effective_progress_mode_for_message("draft-streaming-channel", true),
+            ProgressMode::Verbose
+        );
+    }
+
+    #[test]
+    fn effective_progress_mode_uses_telegram_runtime_setting() {
+        set_runtime_telegram_progress_mode(ProgressMode::Compact);
+        assert_eq!(
+            effective_progress_mode_for_message("telegram", false),
+            ProgressMode::Compact
+        );
+        set_runtime_telegram_progress_mode(ProgressMode::Off);
+        assert_eq!(
+            effective_progress_mode_for_message("telegram", false),
+            ProgressMode::Off
+        );
+    }
+
+    #[test]
+    fn upsert_progress_section_replaces_existing_block() {
+        let mut text = String::new();
+        upsert_progress_section(&mut text, "⏳ shell: ls\n");
+        upsert_progress_section(&mut text, "✅ shell (1s)\n");
+        let stripped = strip_progress_section_markers(&text);
+        assert!(!stripped.contains("⏳ shell: ls"));
+        assert!(stripped.contains("✅ shell (1s)"));
     }
 
     #[test]
