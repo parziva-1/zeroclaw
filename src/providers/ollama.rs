@@ -3,13 +3,14 @@ use crate::providers::traits::{
     ChatMessage, ChatResponse, Provider, ProviderCapabilities, TokenUsage, ToolCall,
 };
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub struct OllamaProvider {
     base_url: String,
-    api_key: Option<String>,
+    api_key: RwLock<Option<String>>,
     reasoning_enabled: Option<bool>,
 }
 
@@ -125,7 +126,7 @@ impl OllamaProvider {
 
         Self {
             base_url: Self::normalize_base_url(base_url.unwrap_or("http://localhost:11434")),
-            api_key,
+            api_key: RwLock::new(api_key),
             reasoning_enabled,
         }
     }
@@ -152,14 +153,14 @@ impl OllamaProvider {
             );
         }
 
-        if requests_cloud && self.api_key.is_none() {
+        if requests_cloud && self.api_key.read().is_none() {
             anyhow::bail!(
                 "Model '{}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key.",
                 model
             );
         }
 
-        let should_auth = self.api_key.is_some() && !self.is_local_endpoint();
+        let should_auth = self.api_key.read().is_some() && !self.is_local_endpoint();
 
         Ok((normalized_model, should_auth))
     }
@@ -370,7 +371,7 @@ impl OllamaProvider {
         let mut request_builder = self.http_client().post(&url).json(&request);
 
         if should_auth {
-            if let Some(key) = self.api_key.as_ref() {
+            if let Some(ref key) = *self.api_key.read() {
                 request_builder = request_builder.bearer_auth(key);
             }
         }
@@ -487,6 +488,10 @@ impl OllamaProvider {
 
 #[async_trait]
 impl Provider for OllamaProvider {
+    fn set_api_key(&self, key: &str) {
+        *self.api_key.write() = Some(key.to_string());
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,

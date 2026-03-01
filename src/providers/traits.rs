@@ -268,6 +268,13 @@ pub enum ToolsPayload {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Replace the API key used for subsequent requests.
+    ///
+    /// Called by [`ReliableProvider`] on rate-limit to rotate to a different
+    /// quota bucket. Default is a no-op; providers that support key rotation
+    /// should override this.
+    fn set_api_key(&self, _key: &str) {}
+
     /// Query provider capabilities.
     ///
     /// Default implementation returns minimal capabilities (no native tool calling).
