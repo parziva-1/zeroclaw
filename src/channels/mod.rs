@@ -543,6 +543,24 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - You can combine text and media in one response — text is sent first, then each attachment.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "lark" | "feishu" => Some(
+            "When responding on Lark/Feishu:\n\
+             - For image attachments, use markers: [IMAGE:<path-or-url-or-data-uri>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Prefer one marker per line to keep delivery deterministic.\n\
+             - If you include both text and images, put text first, then image markers.\n\
+             - Be concise and direct. Skip filler phrases.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
+        "qq" => Some(
+            "When responding on QQ:\n\
+             - For image attachments, use markers: [IMAGE:<path-or-url-or-data-uri>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Prefer one marker per line to keep delivery deterministic.\n\
+             - If you include both text and images, put text first, then image markers.\n\
+             - Be concise and direct. Skip filler phrases.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
         "bluebubbles" => Some(
             "You are responding on iMessage via BlueBubbles. Always complete your research before replying — use as many tool calls as needed to get a full, accurate answer.\n\
              \n\
@@ -5740,18 +5758,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         // Preserve startup perplexity filter config to ensure policy is not weakened
         // when runtime store lookup misses.
         startup_perplexity_filter: config.security.perplexity_filter.clone(),
-        // WASM skill tools are sandboxed by the WASM engine and cannot access the
-        // host filesystem, network, or shell. Pre-approve them so they are not
-        // denied on non-CLI channels (which have no interactive stdin to prompt).
         approval_manager: {
-            let mut autonomy = config.autonomy.clone();
-            let skills_dir = workspace.join("skills");
-            for name in tools::wasm_tool::wasm_tool_names_from_skills(&skills_dir) {
-                if !autonomy.auto_approve.contains(&name) {
-                    autonomy.auto_approve.push(name);
-                }
-            }
-            Arc::new(ApprovalManager::from_config(&autonomy))
+            // Keep approval policy provenance-bound to static config. Do not
+            // auto-approve tool names from untrusted manifest files.
+            Arc::new(ApprovalManager::from_config(&config.autonomy))
         },
         safety_heartbeat: if config.agent.safety_heartbeat_interval > 0 {
             Some(SafetyHeartbeatConfig {
