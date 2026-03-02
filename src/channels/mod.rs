@@ -5391,8 +5391,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         );
     }
 
-    let observer: Arc<dyn Observer> =
+    let base_observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
+    let observer: Arc<dyn Observer> = Arc::new(
+        crate::plugins::bridge::observer::ObserverBridge::new(base_observer),
+    );
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -5728,7 +5731,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
-        hooks: crate::hooks::HookRunner::from_config(&config.hooks).map(Arc::new),
+        hooks: crate::hooks::create_runner_from_config(&config.hooks),
         non_cli_excluded_tools: Arc::new(Mutex::new(
             config.autonomy.non_cli_excluded_tools.clone(),
         )),
