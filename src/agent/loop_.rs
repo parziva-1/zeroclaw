@@ -2718,6 +2718,7 @@ pub async fn run(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        custom_provider_auth_header: config.effective_custom_provider_auth_header(),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
     };
@@ -3423,6 +3424,7 @@ pub async fn process_message_with_session(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        custom_provider_auth_header: config.effective_custom_provider_auth_header(),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
     };
@@ -4738,7 +4740,10 @@ mod tests {
             Arc::clone(&max_active),
         ))];
 
-        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig::default());
+        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig {
+            auto_approve: vec!["shell".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
         approval_mgr.grant_non_cli_session("shell");
 
         let mut history = vec![
