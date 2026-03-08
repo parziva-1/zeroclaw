@@ -522,253 +522,283 @@ impl Channel for WhatsAppWebChannel {
         use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
         use wa_rs_ureq_http::UreqHttpClient;
 
-        tracing::info!(
-            "WhatsApp Web channel starting (session: {})",
-            self.session_path
-        );
-
-        // Initialize storage backend
-        let storage = RusqliteStore::new(&self.session_path)?;
-        let backend = Arc::new(storage);
-
-        // Check if we have a saved device to load
-        let mut device = Device::new(backend.clone());
-        if backend.exists().await? {
-            tracing::info!("WhatsApp Web: found existing session, loading device");
-            if let Some(core_device) = backend.load().await? {
-                device.load_from_serializable(core_device);
-            } else {
-                anyhow::bail!("Device exists but failed to load");
-            }
-        } else {
+        loop {
             tracing::info!(
-                "WhatsApp Web: no existing session, new device will be created during pairing"
+                "WhatsApp Web channel starting (session: {})",
+                self.session_path
             );
-        };
 
-        // Create transport factory
-        let mut transport_factory = TokioWebSocketTransportFactory::new();
-        if let Ok(ws_url) = std::env::var("WHATSAPP_WS_URL") {
-            transport_factory = transport_factory.with_url(ws_url);
-        }
+            // Initialize storage backend
+            let storage = RusqliteStore::new(&self.session_path)?;
+            let backend = Arc::new(storage);
 
-        // Create HTTP client for media operations
-        let http_client = UreqHttpClient::new();
+            // Check if we have a saved device to load
+            let mut device = Device::new(backend.clone());
+            if backend.exists().await? {
+                tracing::info!("WhatsApp Web: found existing session, loading device");
+                if let Some(core_device) = backend.load().await? {
+                    device.load_from_serializable(core_device);
+                } else {
+                    anyhow::bail!("Device exists but failed to load");
+                }
+            } else {
+                tracing::info!(
+                    "WhatsApp Web: no existing session, new device will be created during pairing"
+                );
+            };
 
-        // Build the bot
-        let tx_clone = tx.clone();
-        let allowed_numbers = self.allowed_numbers.clone();
-        let transcription = self.transcription.clone();
+            // Create transport factory
+            let mut transport_factory = TokioWebSocketTransportFactory::new();
+            if let Ok(ws_url) = std::env::var("WHATSAPP_WS_URL") {
+                transport_factory = transport_factory.with_url(ws_url);
+            }
 
-        let mut builder = Bot::builder()
-            .with_backend(backend)
-            .with_transport_factory(transport_factory)
-            .with_http_client(http_client)
-            .on_event(move |event, _client| {
-                let tx_inner = tx_clone.clone();
-                let allowed_numbers = allowed_numbers.clone();
-                let transcription = transcription.clone();
-                async move {
-                    match event {
-                        Event::Message(msg, info) => {
-                            // Extract message content
-                            let text = msg.text_content().unwrap_or("");
-                            let sender = info.source.sender.user().to_string();
-                            let chat = info.source.chat.to_string();
+            // Create HTTP client for media operations
+            let http_client = UreqHttpClient::new();
 
-                            tracing::info!(
-                                "WhatsApp Web message from {} in {}: {}",
-                                sender,
-                                chat,
-                                text
-                            );
+            // Channel to signal logout from the event handler back to the listen loop.
+            let (logout_tx, mut logout_rx) = tokio::sync::broadcast::channel::<()>(1);
 
-                            // Check if sender is allowed
-                            let normalized = if sender.starts_with('+') {
-                                sender.clone()
-                            } else {
-                                format!("+{sender}")
-                            };
+            // Build the bot
+            let tx_clone = tx.clone();
+            let allowed_numbers = self.allowed_numbers.clone();
+            let transcription = self.transcription.clone();
+            let logout_tx_clone = logout_tx.clone();
 
-                            if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
-                                let trimmed = text.trim();
-                                let content = if !trimmed.is_empty() {
-                                    trimmed.to_string()
-                                } else if let Some(ref tc) = transcription {
-                                    // Attempt to transcribe audio/voice messages
-                                    if let Some(ref audio_msg) = msg.audio_message {
-                                        let duration_secs =
-                                            audio_msg.seconds.unwrap_or(0) as u64;
-                                        if duration_secs > tc.max_duration_secs {
-                                            tracing::info!(
-                                                "WhatsApp Web: voice message too long \
-                                                 ({duration_secs}s > {}s), skipping",
-                                                tc.max_duration_secs
-                                            );
-                                            return;
-                                        }
-                                        let mime = audio_msg
-                                            .mimetype
-                                            .as_deref()
-                                            .unwrap_or("audio/ogg");
-                                        let file_name =
-                                            Self::audio_mime_to_filename(mime);
-                                        // download() decrypts the media in one step.
-                                        // audio_msg is Box<AudioMessage>; .as_ref() yields
-                                        // &AudioMessage which implements Downloadable.
-                                        match _client.download(audio_msg.as_ref()).await {
-                                            Ok(audio_bytes) => {
-                                                match super::transcription::transcribe_audio(
-                                                    audio_bytes,
-                                                    file_name,
-                                                    tc,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(t) if !t.trim().is_empty() => {
-                                                        format!("[Voice] {}", t.trim())
-                                                    }
-                                                    Ok(_) => {
-                                                        tracing::info!(
-                                                            "WhatsApp Web: voice transcription \
-                                                             returned empty text, skipping"
-                                                        );
-                                                        return;
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            "WhatsApp Web: voice transcription \
-                                                             failed: {e}"
-                                                        );
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "WhatsApp Web: failed to download voice \
-                                                     audio: {e}"
+            let mut builder = Bot::builder()
+                .with_backend(backend)
+                .with_transport_factory(transport_factory)
+                .with_http_client(http_client)
+                .on_event(move |event, _client| {
+                    let tx_inner = tx_clone.clone();
+                    let allowed_numbers = allowed_numbers.clone();
+                    let transcription = transcription.clone();
+                    let logout_tx = logout_tx_clone.clone();
+                    async move {
+                        match event {
+                            Event::Message(msg, info) => {
+                                // Extract message content
+                                let text = msg.text_content().unwrap_or("");
+                                let sender = info.source.sender.user().to_string();
+                                let chat = info.source.chat.to_string();
+
+                                tracing::info!(
+                                    "WhatsApp Web message from {} in {}: {}",
+                                    sender,
+                                    chat,
+                                    text
+                                );
+
+                                // Check if sender is allowed
+                                let normalized = if sender.starts_with('+') {
+                                    sender.clone()
+                                } else {
+                                    format!("+{sender}")
+                                };
+
+                                if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
+                                    let trimmed = text.trim();
+                                    let content = if !trimmed.is_empty() {
+                                        trimmed.to_string()
+                                    } else if let Some(ref tc) = transcription {
+                                        // Attempt to transcribe audio/voice messages
+                                        if let Some(ref audio_msg) = msg.audio_message {
+                                            let duration_secs =
+                                                audio_msg.seconds.unwrap_or(0) as u64;
+                                            if duration_secs > tc.max_duration_secs {
+                                                tracing::info!(
+                                                    "WhatsApp Web: voice message too long \
+                                                     ({duration_secs}s > {}s), skipping",
+                                                    tc.max_duration_secs
                                                 );
                                                 return;
                                             }
+                                            let mime = audio_msg
+                                                .mimetype
+                                                .as_deref()
+                                                .unwrap_or("audio/ogg");
+                                            let file_name =
+                                                Self::audio_mime_to_filename(mime);
+                                            // download() decrypts the media in one step.
+                                            // audio_msg is Box<AudioMessage>; .as_ref() yields
+                                            // &AudioMessage which implements Downloadable.
+                                            match _client.download(audio_msg.as_ref()).await {
+                                                Ok(audio_bytes) => {
+                                                    match super::transcription::transcribe_audio(
+                                                        audio_bytes,
+                                                        file_name,
+                                                        tc,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(t) if !t.trim().is_empty() => {
+                                                            format!("[Voice] {}", t.trim())
+                                                        }
+                                                        Ok(_) => {
+                                                            tracing::info!(
+                                                                "WhatsApp Web: voice transcription \
+                                                                 returned empty text, skipping"
+                                                            );
+                                                            return;
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "WhatsApp Web: voice transcription \
+                                                                 failed: {e}"
+                                                            );
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        "WhatsApp Web: failed to download voice \
+                                                         audio: {e}"
+                                                    );
+                                                    return;
+                                                }
+                                            }
+                                        } else {
+                                            tracing::debug!(
+                                                "WhatsApp Web: ignoring non-text/non-audio \
+                                                 message from {}",
+                                                normalized
+                                            );
+                                            return;
                                         }
                                     } else {
                                         tracing::debug!(
-                                            "WhatsApp Web: ignoring non-text/non-audio \
-                                             message from {}",
+                                            "WhatsApp Web: ignoring empty or non-text message \
+                                             from {}",
                                             normalized
                                         );
                                         return;
+                                    };
+
+                                    if let Err(e) = tx_inner
+                                        .send(ChannelMessage {
+                                            id: uuid::Uuid::new_v4().to_string(),
+                                            channel: "whatsapp".to_string(),
+                                            sender: normalized.clone(),
+                                            // Reply to the originating chat JID (DM or group).
+                                            reply_target: chat,
+                                            content,
+                                            timestamp: chrono::Utc::now().timestamp() as u64,
+                                            thread_ts: None,
+                                        })
+                                        .await
+                                    {
+                                        tracing::error!("Failed to send message to channel: {}", e);
                                     }
                                 } else {
-                                    tracing::debug!(
-                                        "WhatsApp Web: ignoring empty or non-text message \
-                                         from {}",
-                                        normalized
-                                    );
-                                    return;
-                                };
-
-                                if let Err(e) = tx_inner
-                                    .send(ChannelMessage {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        channel: "whatsapp".to_string(),
-                                        sender: normalized.clone(),
-                                        // Reply to the originating chat JID (DM or group).
-                                        reply_target: chat,
-                                        content,
-                                        timestamp: chrono::Utc::now().timestamp() as u64,
-                                        thread_ts: None,
-                                    })
-                                    .await
-                                {
-                                    tracing::error!("Failed to send message to channel: {}", e);
-                                }
-                            } else {
-                                tracing::warn!("WhatsApp Web: message from {} not in allowed list", normalized);
-                            }
-                        }
-                        Event::Connected(_) => {
-                            tracing::info!("WhatsApp Web connected successfully");
-                        }
-                        Event::LoggedOut(_) => {
-                            tracing::warn!("WhatsApp Web was logged out");
-                        }
-                        Event::StreamError(stream_error) => {
-                            tracing::error!("WhatsApp Web stream error: {:?}", stream_error);
-                        }
-                        Event::PairingCode { code, .. } => {
-                            tracing::info!("WhatsApp Web pair code received: {}", code);
-                            tracing::info!(
-                                "Link your phone by entering this code in WhatsApp > Linked Devices"
-                            );
-                        }
-                        Event::PairingQrCode { code, .. } => {
-                            tracing::info!(
-                                "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)"
-                            );
-                            match Self::render_pairing_qr(&code) {
-                                Ok(rendered) => {
-                                    eprintln!();
-                                    eprintln!(
-                                        "WhatsApp Web QR code (scan in WhatsApp > Linked Devices):"
-                                    );
-                                    eprintln!("{rendered}");
-                                    eprintln!();
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        "WhatsApp Web: failed to render pairing QR in terminal: {}",
-                                        err
-                                    );
-                                    tracing::info!("WhatsApp Web QR payload: {}", code);
+                                    tracing::warn!("WhatsApp Web: message from {} not in allowed list", normalized);
                                 }
                             }
+                            Event::Connected(_) => {
+                                tracing::info!("WhatsApp Web connected successfully");
+                            }
+                            Event::LoggedOut(_) => {
+                                tracing::warn!(
+                                    "WhatsApp Web was logged out — will clear session and reconnect"
+                                );
+                                let _ = logout_tx.send(());
+                            }
+                            Event::StreamError(stream_error) => {
+                                tracing::error!("WhatsApp Web stream error: {:?}", stream_error);
+                            }
+                            Event::PairingCode { code, .. } => {
+                                tracing::info!("WhatsApp Web pair code received: {}", code);
+                                tracing::info!(
+                                    "Link your phone by entering this code in WhatsApp > Linked Devices"
+                                );
+                            }
+                            Event::PairingQrCode { code, .. } => {
+                                tracing::info!(
+                                    "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)"
+                                );
+                                match Self::render_pairing_qr(&code) {
+                                    Ok(rendered) => {
+                                        eprintln!();
+                                        eprintln!(
+                                            "WhatsApp Web QR code (scan in WhatsApp > Linked Devices):"
+                                        );
+                                        eprintln!("{rendered}");
+                                        eprintln!();
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            "WhatsApp Web: failed to render pairing QR in terminal: {}",
+                                            err
+                                        );
+                                        tracing::info!("WhatsApp Web QR payload: {}", code);
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
+                });
+
+            // Configure pair-code flow when a phone number is provided.
+            if let Some(ref phone) = self.pair_phone {
+                tracing::info!("WhatsApp Web: pair-code flow enabled for configured phone number");
+                builder = builder.with_pair_code(PairCodeOptions {
+                    phone_number: phone.clone(),
+                    custom_code: self.pair_code.clone(),
+                    ..Default::default()
+                });
+            } else if self.pair_code.is_some() {
+                tracing::warn!(
+                    "WhatsApp Web: pair_code is set but pair_phone is missing; pair code config is ignored"
+                );
+            }
+
+            let mut bot = builder.build().await?;
+            *self.client.lock() = Some(bot.client());
+
+            // Run the bot
+            let bot_handle = bot.run().await?;
+
+            // Store the bot handle for later shutdown
+            *self.bot_handle.lock() = Some(bot_handle);
+
+            // Wait for logout signal or process shutdown.
+            let should_reconnect = select! {
+                res = logout_rx.recv() => {
+                    // A send error means the sender was dropped (bot task ended) — treat
+                    // that the same as an explicit logout signal.
+                    let _ = res;
+                    true
                 }
-            })
-            ;
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("WhatsApp Web channel received Ctrl+C");
+                    false
+                }
+            };
 
-        // Configure pair-code flow when a phone number is provided.
-        if let Some(ref phone) = self.pair_phone {
-            tracing::info!("WhatsApp Web: pair-code flow enabled for configured phone number");
-            builder = builder.with_pair_code(PairCodeOptions {
-                phone_number: phone.clone(),
-                custom_code: self.pair_code.clone(),
-                ..Default::default()
-            });
-        } else if self.pair_code.is_some() {
-            tracing::warn!(
-                "WhatsApp Web: pair_code is set but pair_phone is missing; pair code config is ignored"
-            );
-        }
-
-        let mut bot = builder.build().await?;
-        *self.client.lock() = Some(bot.client());
-
-        // Run the bot
-        let bot_handle = bot.run().await?;
-
-        // Store the bot handle for later shutdown
-        *self.bot_handle.lock() = Some(bot_handle);
-
-        // Wait for shutdown signal
-        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-
-        select! {
-            _ = shutdown_rx.recv() => {
-                tracing::info!("WhatsApp Web channel shutting down");
+            *self.client.lock() = None;
+            if let Some(handle) = self.bot_handle.lock().take() {
+                handle.abort();
             }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("WhatsApp Web channel received Ctrl+C");
-            }
-        }
 
-        *self.client.lock() = None;
-        if let Some(handle) = self.bot_handle.lock().take() {
-            handle.abort();
+            if should_reconnect {
+                // Delete the session file so the next loop iteration starts fresh QR pairing.
+                let expanded = shellexpand::tilde(&self.session_path).to_string();
+                match tokio::fs::remove_file(&expanded).await {
+                    Ok(()) => tracing::info!(
+                        "WhatsApp Web: session file removed, restarting for QR pairing"
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!(
+                        "WhatsApp Web: failed to remove session file {expanded}: {e}"
+                    ),
+                }
+                // Brief pause before reconnect to avoid hammering the server.
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                continue;
+            }
+
+            break;
         }
 
         Ok(())
