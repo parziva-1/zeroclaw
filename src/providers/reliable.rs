@@ -152,6 +152,20 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     false
 }
 
+/// Check if an error is an authentication/authorization failure (401/403).
+/// Used to allow key rotation past auth errors when unused keys remain.
+fn is_auth_error(err: &anyhow::Error) -> bool {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+        if let Some(status) = reqwest_err.status() {
+            return matches!(status.as_u16(), 401 | 403);
+        }
+    }
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+    (msg.contains("401") && lower.contains("unauthorized"))
+        || (msg.contains("403") && lower.contains("forbidden"))
+}
+
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
 /// Looks for patterns like `Retry-After: 5` or `retry_after: 2.5` in the error string.
 fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
@@ -388,6 +402,7 @@ impl Provider for ReliableProvider {
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);
                 for sent_model in sent_models {
                     let mut backoff_ms = self.base_backoff_ms;
+                    let mut auth_rotations: usize = 0;
 
                     for attempt in 0..=self.max_retries {
                         match provider
@@ -411,6 +426,9 @@ impl Provider for ReliableProvider {
                                 let non_retryable =
                                     is_non_retryable(&e) || non_retryable_rate_limit;
                                 let rate_limited = is_rate_limited(&e);
+                                let auth_error = is_auth_error(&e);
+                                let can_rotate_auth =
+                                    auth_error && auth_rotations < self.api_keys.len();
                                 let failure_reason = failure_reason(rate_limited, non_retryable);
                                 let error_detail = compact_error_detail(&e);
 
@@ -424,21 +442,25 @@ impl Provider for ReliableProvider {
                                     &error_detail,
                                 );
 
-                                // Rate-limit with rotatable keys: cycle to the next API key
-                                // so the retry hits a different quota bucket.
-                                if rate_limited && !non_retryable_rate_limit {
+                                // Rate-limit or auth error with rotatable keys: cycle to the
+                                // next API key so the retry hits a different credential.
+                                if (rate_limited && !non_retryable_rate_limit) || can_rotate_auth {
                                     if let Some(new_key) = self.rotate_key() {
                                         provider.set_api_key(new_key);
+                                        if auth_error {
+                                            auth_rotations += 1;
+                                        }
                                         tracing::info!(
                                             provider = provider_name,
                                             error = %error_detail,
-                                            "Rate limited; rotated to key ending ...{}",
+                                            "{}; rotated to key ending ...{}",
+                                            if auth_error { "Auth failed" } else { "Rate limited" },
                                             &new_key[new_key.len().saturating_sub(4)..]
                                         );
                                     }
                                 }
 
-                                if non_retryable {
+                                if non_retryable && !can_rotate_auth {
                                     tracing::warn!(
                                         provider = provider_name,
                                         model = sent_model,
@@ -512,6 +534,7 @@ impl Provider for ReliableProvider {
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);
                 for sent_model in sent_models {
                     let mut backoff_ms = self.base_backoff_ms;
+                    let mut auth_rotations: usize = 0;
 
                     for attempt in 0..=self.max_retries {
                         match provider
@@ -535,6 +558,9 @@ impl Provider for ReliableProvider {
                                 let non_retryable =
                                     is_non_retryable(&e) || non_retryable_rate_limit;
                                 let rate_limited = is_rate_limited(&e);
+                                let auth_error = is_auth_error(&e);
+                                let can_rotate_auth =
+                                    auth_error && auth_rotations < self.api_keys.len();
                                 let failure_reason = failure_reason(rate_limited, non_retryable);
                                 let error_detail = compact_error_detail(&e);
 
@@ -548,19 +574,25 @@ impl Provider for ReliableProvider {
                                     &error_detail,
                                 );
 
-                                if rate_limited && !non_retryable_rate_limit {
+                                // Rate-limit or auth error with rotatable keys: cycle to the
+                                // next API key so the retry hits a different credential.
+                                if (rate_limited && !non_retryable_rate_limit) || can_rotate_auth {
                                     if let Some(new_key) = self.rotate_key() {
                                         provider.set_api_key(new_key);
+                                        if auth_error {
+                                            auth_rotations += 1;
+                                        }
                                         tracing::info!(
                                             provider = provider_name,
                                             error = %error_detail,
-                                            "Rate limited; rotated to key ending ...{}",
+                                            "{}; rotated to key ending ...{}",
+                                            if auth_error { "Auth failed" } else { "Rate limited" },
                                             &new_key[new_key.len().saturating_sub(4)..]
                                         );
                                     }
                                 }
 
-                                if non_retryable {
+                                if non_retryable && !can_rotate_auth {
                                     tracing::warn!(
                                         provider = provider_name,
                                         model = sent_model,
@@ -642,6 +674,7 @@ impl Provider for ReliableProvider {
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);
                 for sent_model in sent_models {
                     let mut backoff_ms = self.base_backoff_ms;
+                    let mut auth_rotations: usize = 0;
 
                     for attempt in 0..=self.max_retries {
                         match provider
@@ -665,6 +698,9 @@ impl Provider for ReliableProvider {
                                 let non_retryable =
                                     is_non_retryable(&e) || non_retryable_rate_limit;
                                 let rate_limited = is_rate_limited(&e);
+                                let auth_error = is_auth_error(&e);
+                                let can_rotate_auth =
+                                    auth_error && auth_rotations < self.api_keys.len();
                                 let failure_reason = failure_reason(rate_limited, non_retryable);
                                 let error_detail = compact_error_detail(&e);
 
@@ -678,19 +714,25 @@ impl Provider for ReliableProvider {
                                     &error_detail,
                                 );
 
-                                if rate_limited && !non_retryable_rate_limit {
+                                // Rate-limit or auth error with rotatable keys: cycle to the
+                                // next API key so the retry hits a different credential.
+                                if (rate_limited && !non_retryable_rate_limit) || can_rotate_auth {
                                     if let Some(new_key) = self.rotate_key() {
                                         provider.set_api_key(new_key);
+                                        if auth_error {
+                                            auth_rotations += 1;
+                                        }
                                         tracing::info!(
                                             provider = provider_name,
                                             error = %error_detail,
-                                            "Rate limited; rotated to key ending ...{}",
+                                            "{}; rotated to key ending ...{}",
+                                            if auth_error { "Auth failed" } else { "Rate limited" },
                                             &new_key[new_key.len().saturating_sub(4)..]
                                         );
                                     }
                                 }
 
-                                if non_retryable {
+                                if non_retryable && !can_rotate_auth {
                                     tracing::warn!(
                                         provider = provider_name,
                                         model = sent_model,
@@ -756,6 +798,7 @@ impl Provider for ReliableProvider {
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);
                 for sent_model in sent_models {
                     let mut backoff_ms = self.base_backoff_ms;
+                    let mut auth_rotations: usize = 0;
 
                     for attempt in 0..=self.max_retries {
                         let req = ChatRequest {
@@ -780,6 +823,9 @@ impl Provider for ReliableProvider {
                                 let non_retryable =
                                     is_non_retryable(&e) || non_retryable_rate_limit;
                                 let rate_limited = is_rate_limited(&e);
+                                let auth_error = is_auth_error(&e);
+                                let can_rotate_auth =
+                                    auth_error && auth_rotations < self.api_keys.len();
                                 let failure_reason = failure_reason(rate_limited, non_retryable);
                                 let error_detail = compact_error_detail(&e);
 
@@ -793,19 +839,25 @@ impl Provider for ReliableProvider {
                                     &error_detail,
                                 );
 
-                                if rate_limited && !non_retryable_rate_limit {
+                                // Rate-limit or auth error with rotatable keys: cycle to the
+                                // next API key so the retry hits a different credential.
+                                if (rate_limited && !non_retryable_rate_limit) || can_rotate_auth {
                                     if let Some(new_key) = self.rotate_key() {
                                         provider.set_api_key(new_key);
+                                        if auth_error {
+                                            auth_rotations += 1;
+                                        }
                                         tracing::info!(
                                             provider = provider_name,
                                             error = %error_detail,
-                                            "Rate limited; rotated to key ending ...{}",
+                                            "{}; rotated to key ending ...{}",
+                                            if auth_error { "Auth failed" } else { "Rate limited" },
                                             &new_key[new_key.len().saturating_sub(4)..]
                                         );
                                     }
                                 }
 
-                                if non_retryable {
+                                if non_retryable && !can_rotate_auth {
                                     tracing::warn!(
                                         provider = provider_name,
                                         model = sent_model,
@@ -2249,5 +2301,159 @@ mod tests {
         );
         // No override set → should defer to provider default (false)
         assert!(!provider.supports_vision());
+    }
+
+    // ── Auth-error key rotation tests ──────────────────────────────
+
+    #[test]
+    fn is_auth_error_detects_401_string() {
+        assert!(is_auth_error(&anyhow::anyhow!("401 Unauthorized")));
+    }
+
+    #[test]
+    fn is_auth_error_detects_403_string() {
+        assert!(is_auth_error(&anyhow::anyhow!("403 Forbidden")));
+    }
+
+    #[test]
+    fn is_auth_error_ignores_other_errors() {
+        assert!(!is_auth_error(&anyhow::anyhow!("429 Too Many Requests")));
+        assert!(!is_auth_error(&anyhow::anyhow!("500 Internal Server Error")));
+        assert!(!is_auth_error(&anyhow::anyhow!("connection reset")));
+        assert!(!is_auth_error(&anyhow::anyhow!("invalid api key")));
+    }
+
+    /// Mock provider that fails with a configurable error based on the current
+    /// API key, tracking how many keys were tried via `set_api_key`.
+    struct AuthRotationMock {
+        calls: Arc<AtomicUsize>,
+        keys_set: parking_lot::Mutex<Vec<String>>,
+        /// Keys that should succeed; all others return 401.
+        good_keys: Vec<String>,
+        /// The initial key (before any rotation).
+        initial_key: String,
+        response: &'static str,
+    }
+
+    impl AuthRotationMock {
+        fn current_key(&self) -> String {
+            self.keys_set
+                .lock()
+                .last()
+                .cloned()
+                .unwrap_or_else(|| self.initial_key.clone())
+        }
+    }
+
+    #[async_trait]
+    impl Provider for AuthRotationMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let key = self.current_key();
+            if self.good_keys.contains(&key) {
+                Ok(self.response.to_string())
+            } else {
+                anyhow::bail!("401 Unauthorized: invalid key {}", key)
+            }
+        }
+
+        fn set_api_key(&self, key: &str) {
+            self.keys_set.lock().push(key.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_error_rotates_keys_until_success() {
+        // Keys: initial=bad1, rotation pool=[bad2, good3]
+        // Expected: bad1 → 401 → rotate to bad2 → 401 → rotate to good3 → success
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "ollama".into(),
+                Box::new(AuthRotationMock {
+                    calls: Arc::clone(&calls),
+                    keys_set: parking_lot::Mutex::new(Vec::new()),
+                    good_keys: vec!["good3".into()],
+                    initial_key: "bad1".into(),
+                    response: "success",
+                }) as Box<dyn Provider>,
+            )],
+            5, // enough retries
+            1,
+        )
+        .with_api_keys(vec!["bad2".into(), "good3".into()]);
+
+        let result = provider.simple_chat("hello", "test", 0.0).await.unwrap();
+        assert_eq!(result, "success");
+        // Should have tried: bad1, bad2, good3 = 3 calls
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn auth_error_exhausts_all_keys_then_fails() {
+        // All keys are bad — should try each once then stop (not infinite loop).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "ollama".into(),
+                Box::new(AuthRotationMock {
+                    calls: Arc::clone(&calls),
+                    keys_set: parking_lot::Mutex::new(Vec::new()),
+                    good_keys: vec![], // no good keys
+                    initial_key: "bad1".into(),
+                    response: "never",
+                }) as Box<dyn Provider>,
+            )],
+            10, // plenty of retries — should NOT use them all
+            1,
+        )
+        .with_api_keys(vec!["bad2".into(), "bad3".into()]);
+
+        let result = provider.simple_chat("hello", "test", 0.0).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("All providers/models failed"));
+        // Should try: bad1 → bad2 → bad3 → no more rotation keys, break.
+        // That's 3 calls (initial + 2 rotations), then the non_retryable break fires.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "should try exactly initial + rotation pool size keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_error_no_rotation_keys_breaks_immediately() {
+        // No rotation keys configured — 401 should be non-retryable as before.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "ollama".into(),
+                Box::new(AuthRotationMock {
+                    calls: Arc::clone(&calls),
+                    keys_set: parking_lot::Mutex::new(Vec::new()),
+                    good_keys: vec![],
+                    initial_key: "bad1".into(),
+                    response: "never",
+                }) as Box<dyn Provider>,
+            )],
+            5,
+            1,
+        );
+        // No .with_api_keys() — empty pool
+
+        let result = provider.simple_chat("hello", "test", 0.0).await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "401 without rotation keys must break immediately (1 call only)"
+        );
     }
 }
